@@ -18,5 +18,7 @@ bytemsg233 install-lib go --to ./third_party/bytemsg233
 
 - `Writer`: field header and scalar writing helpers.
 - `Reader`: field header and scalar reading helpers.
-- `Pool[T]`: generated model object pooling.
+- `Pool[T]`: single-threaded generated model object pooling.
 - `EnumFromValue`: small enum restore helper for generated code.
+
+Runtime encode/decode and pool helpers are single-threaded. No `sync.Pool`, mutex, channel, goroutine, or hidden worker is used.

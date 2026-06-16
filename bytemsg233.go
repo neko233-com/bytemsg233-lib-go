@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"sync"
 )
 
 type WireType uint8
@@ -20,22 +19,29 @@ type Resettable interface {
 }
 
 type Pool[T Resettable] struct {
-	pool sync.Pool
+	items   []T
+	factory func() T
 }
 
 func NewPool[T Resettable](factory func() T) *Pool[T] {
 	return &Pool[T]{
-		pool: sync.Pool{New: func() any { return factory() }},
+		items:   make([]T, 0),
+		factory: factory,
 	}
 }
 
 func (p *Pool[T]) Acquire() T {
-	return p.pool.Get().(T)
+	if n := len(p.items); n > 0 {
+		value := p.items[n-1]
+		p.items = p.items[:n-1]
+		return value
+	}
+	return p.factory()
 }
 
 func (p *Pool[T]) Release(value T) {
 	value.Reset()
-	p.pool.Put(value)
+	p.items = append(p.items, value)
 }
 
 type Writer struct {
