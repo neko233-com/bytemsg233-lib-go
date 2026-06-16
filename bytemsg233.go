@@ -1,10 +1,10 @@
 package bytemsg233
 
 import (
-	"bytes"
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"unsafe"
 )
 
 type WireType uint8
@@ -13,6 +13,8 @@ const (
 	WireVarint WireType = 0
 	WireBytes  WireType = 2
 )
+
+var errVarintOverflow = errors.New("bytemsg233: varint overflows a 64-bit integer")
 
 type Resettable interface {
 	Reset()
@@ -45,15 +47,23 @@ func (p *Pool[T]) Release(value T) {
 }
 
 type Writer struct {
-	buf bytes.Buffer
+	buf []byte
 }
 
 func NewWriter() *Writer {
 	return &Writer{}
 }
 
+func NewWriterSize(size int) *Writer {
+	return &Writer{buf: make([]byte, 0, size)}
+}
+
 func (w *Writer) Bytes() []byte {
-	return w.buf.Bytes()
+	return w.buf
+}
+
+func (w *Writer) Reset() {
+	w.buf = w.buf[:0]
 }
 
 func (w *Writer) WriteHeader(tag uint32, wireType WireType) {
@@ -61,54 +71,126 @@ func (w *Writer) WriteHeader(tag uint32, wireType WireType) {
 }
 
 func (w *Writer) WriteVarint(value uint64) {
-	var tmp [10]byte
-	n := binary.PutUvarint(tmp[:], value)
-	w.buf.Write(tmp[:n])
+	for value >= 0x80 {
+		w.buf = append(w.buf, byte(value)|0x80)
+		value >>= 7
+	}
+	w.buf = append(w.buf, byte(value))
 }
 
 func (w *Writer) WriteString(tag uint32, value string) {
 	w.WriteHeader(tag, WireBytes)
 	w.WriteVarint(uint64(len(value)))
-	w.buf.WriteString(value)
+	w.buf = append(w.buf, value...)
 }
 
 type Reader struct {
-	r *bytes.Reader
+	data []byte
+	pos  int
 }
 
 func NewReader(data []byte) *Reader {
-	return &Reader{r: bytes.NewReader(data)}
+	return &Reader{data: data}
+}
+
+func (r *Reader) Reset(data []byte) {
+	r.data = data
+	r.pos = 0
 }
 
 func (r *Reader) EOF() bool {
-	return r.r.Len() == 0
+	return r.pos >= len(r.data)
+}
+
+func (r *Reader) Remaining() int {
+	return len(r.data) - r.pos
 }
 
 func (r *Reader) ReadHeader() (uint32, WireType, error) {
-	value, err := binary.ReadUvarint(r.r)
-	if err != nil {
-		return 0, 0, err
+	if r.pos >= len(r.data) {
+		return 0, 0, io.ErrUnexpectedEOF
+	}
+	b := r.data[r.pos]
+	var value uint64
+	if b < 0x80 {
+		r.pos++
+		value = uint64(b)
+	} else {
+		var err error
+		value, err = r.readVarintSlow()
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 	return uint32(value >> 3), WireType(value & 0x7), nil
 }
 
 func (r *Reader) ReadVarint() (uint64, error) {
-	return binary.ReadUvarint(r.r)
+	if r.pos >= len(r.data) {
+		return 0, io.ErrUnexpectedEOF
+	}
+	b := r.data[r.pos]
+	if b < 0x80 {
+		r.pos++
+		return uint64(b), nil
+	}
+	return r.readVarintSlow()
 }
 
 func (r *Reader) ReadString() (string, error) {
-	n, err := binary.ReadUvarint(r.r)
-	if err != nil {
-		return "", err
-	}
-	if n > uint64(r.r.Len()) {
+	if r.pos >= len(r.data) {
 		return "", io.ErrUnexpectedEOF
 	}
-	data := make([]byte, n)
-	if _, err := io.ReadFull(r.r, data); err != nil {
-		return "", err
+	b := r.data[r.pos]
+	var n uint64
+	if b < 0x80 {
+		r.pos++
+		n = uint64(b)
+	} else {
+		var err error
+		n, err = r.readVarintSlow()
+		if err != nil {
+			return "", err
+		}
 	}
-	return string(data), nil
+	if n > uint64(len(r.data)-r.pos) {
+		return "", io.ErrUnexpectedEOF
+	}
+	start := r.pos
+	r.pos += int(n)
+	return string(r.data[start:r.pos]), nil
+}
+
+// ReadStringView reads a length-prefixed string without copying.
+//
+// The returned string aliases the reader input. Use it only when the input
+// byte slice will stay alive and immutable for at least as long as the string.
+func (r *Reader) ReadStringView() (string, error) {
+	if r.pos >= len(r.data) {
+		return "", io.ErrUnexpectedEOF
+	}
+	b := r.data[r.pos]
+	var n uint64
+	if b < 0x80 {
+		r.pos++
+		n = uint64(b)
+	} else {
+		var err error
+		n, err = r.readVarintSlow()
+		if err != nil {
+			return "", err
+		}
+	}
+	if n > uint64(len(r.data)-r.pos) {
+		return "", io.ErrUnexpectedEOF
+	}
+	start := r.pos
+	r.pos += int(n)
+	if n == 0 {
+		return "", nil
+	}
+	value := r.data[start:r.pos]
+	return unsafe.String(unsafe.SliceData(value), len(value)), nil
 }
 
 func EnumFromValue[T ~int32](value int32, ok func(T) bool) (T, error) {
@@ -117,4 +199,23 @@ func EnumFromValue[T ~int32](value int32, ok func(T) bool) (T, error) {
 		return candidate, nil
 	}
 	return candidate, fmt.Errorf("unknown enum value: %d", value)
+}
+
+func (r *Reader) readVarintSlow() (uint64, error) {
+	var value uint64
+	for shift := uint(0); shift < 64; shift += 7 {
+		if r.pos >= len(r.data) {
+			return 0, io.ErrUnexpectedEOF
+		}
+		b := r.data[r.pos]
+		r.pos++
+		if b < 0x80 {
+			if shift == 63 && b > 1 {
+				return 0, errVarintOverflow
+			}
+			return value | uint64(b)<<shift, nil
+		}
+		value |= uint64(b&0x7f) << shift
+	}
+	return 0, errVarintOverflow
 }
