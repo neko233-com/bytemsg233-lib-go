@@ -14,6 +14,17 @@ const (
 	WireBytes  WireType = 2
 )
 
+type BlockKind uint8
+
+const (
+	BlockPackedVarint BlockKind = 1
+	BlockPackedZigzag BlockKind = 2
+	BlockDeltaVarint  BlockKind = 3
+	BlockBoolBitset   BlockKind = 4
+	BlockStringList   BlockKind = 5
+	BlockColumnList   BlockKind = 6
+)
+
 var errVarintOverflow = errors.New("bytemsg233: varint overflows a 64-bit integer")
 
 type Resettable interface {
@@ -82,6 +93,51 @@ func (w *Writer) WriteString(tag uint32, value string) {
 	w.WriteHeader(tag, WireBytes)
 	w.WriteVarint(uint64(len(value)))
 	w.buf = append(w.buf, value...)
+}
+
+func (w *Writer) WritePackedVarints(values []uint64) {
+	w.WriteVarint(uint64(len(values)))
+	for _, value := range values {
+		w.WriteVarint(value)
+	}
+}
+
+func (w *Writer) WriteDeltaVarints(values []uint64) {
+	w.WriteVarint(uint64(len(values)))
+	if len(values) == 0 {
+		return
+	}
+	prev := values[0]
+	w.WriteVarint(prev)
+	for _, value := range values[1:] {
+		w.WriteVarint(ZigZagEncode(int64(value) - int64(prev)))
+		prev = value
+	}
+}
+
+func (w *Writer) WriteBoolBitset(values []bool) {
+	w.WriteVarint(uint64(len(values)))
+	var current byte
+	for i, value := range values {
+		if value {
+			current |= 1 << uint(i&7)
+		}
+		if i&7 == 7 {
+			w.buf = append(w.buf, current)
+			current = 0
+		}
+	}
+	if len(values)&7 != 0 {
+		w.buf = append(w.buf, current)
+	}
+}
+
+func (w *Writer) WriteStringList(values []string) {
+	w.WriteVarint(uint64(len(values)))
+	for _, value := range values {
+		w.WriteVarint(uint64(len(value)))
+		w.buf = append(w.buf, value...)
+	}
 }
 
 type Reader struct {
@@ -193,12 +249,132 @@ func (r *Reader) ReadStringView() (string, error) {
 	return unsafe.String(unsafe.SliceData(value), len(value)), nil
 }
 
+func (r *Reader) ReadBytesView() ([]byte, error) {
+	n, err := r.ReadVarint()
+	if err != nil {
+		return nil, err
+	}
+	if n > uint64(len(r.data)-r.pos) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	start := r.pos
+	r.pos += int(n)
+	return r.data[start:r.pos], nil
+}
+
+func (r *Reader) ReadPackedVarints(dst []uint64) ([]uint64, error) {
+	count, err := r.ReadVarint()
+	if err != nil {
+		return dst, err
+	}
+	if uint64(cap(dst)) < count {
+		dst = make([]uint64, 0, int(count))
+	} else {
+		dst = dst[:0]
+	}
+	for i := uint64(0); i < count; i++ {
+		value, err := r.ReadVarint()
+		if err != nil {
+			return dst, err
+		}
+		dst = append(dst, value)
+	}
+	return dst, nil
+}
+
+func (r *Reader) ReadDeltaVarints(dst []uint64) ([]uint64, error) {
+	count, err := r.ReadVarint()
+	if err != nil {
+		return dst, err
+	}
+	if uint64(cap(dst)) < count {
+		dst = make([]uint64, 0, int(count))
+	} else {
+		dst = dst[:0]
+	}
+	if count == 0 {
+		return dst, nil
+	}
+	value, err := r.ReadVarint()
+	if err != nil {
+		return dst, err
+	}
+	dst = append(dst, value)
+	for i := uint64(1); i < count; i++ {
+		deltaRaw, err := r.ReadVarint()
+		if err != nil {
+			return dst, err
+		}
+		value = uint64(int64(value) + ZigZagDecode(deltaRaw))
+		dst = append(dst, value)
+	}
+	return dst, nil
+}
+
+func (r *Reader) ReadBoolBitset(dst []bool) ([]bool, error) {
+	count, err := r.ReadVarint()
+	if err != nil {
+		return dst, err
+	}
+	if uint64(cap(dst)) < count {
+		dst = make([]bool, int(count))
+	} else {
+		dst = dst[:int(count)]
+		for i := range dst {
+			dst[i] = false
+		}
+	}
+	for i := uint64(0); i < count; i += 8 {
+		if r.pos >= len(r.data) {
+			return dst, io.ErrUnexpectedEOF
+		}
+		current := r.data[r.pos]
+		r.pos++
+		limit := uint64(8)
+		if remaining := count - i; remaining < limit {
+			limit = remaining
+		}
+		for bit := uint64(0); bit < limit; bit++ {
+			dst[int(i+bit)] = current&(1<<bit) != 0
+		}
+	}
+	return dst, nil
+}
+
+func (r *Reader) ReadStringList(dst []string) ([]string, error) {
+	count, err := r.ReadVarint()
+	if err != nil {
+		return dst, err
+	}
+	if uint64(cap(dst)) < count {
+		dst = make([]string, 0, int(count))
+	} else {
+		dst = dst[:0]
+	}
+	for i := uint64(0); i < count; i++ {
+		value, err := r.ReadStringView()
+		if err != nil {
+			return dst, err
+		}
+		dst = append(dst, value)
+	}
+	return dst, nil
+}
+
 func EnumFromValue[T ~int32](value int32, ok func(T) bool) (T, error) {
 	candidate := T(value)
 	if ok(candidate) {
 		return candidate, nil
 	}
 	return candidate, fmt.Errorf("unknown enum value: %d", value)
+}
+
+func ZigZagEncode(value int64) uint64 {
+	return uint64((value << 1) ^ (value >> 63))
+}
+
+func ZigZagDecode(value uint64) int64 {
+	return int64((value >> 1) ^ -(value & 1))
 }
 
 func (r *Reader) readVarintSlow() (uint64, error) {
