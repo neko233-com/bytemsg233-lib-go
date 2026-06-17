@@ -1,6 +1,7 @@
 package bytemsg233
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -10,8 +11,10 @@ import (
 type WireType uint8
 
 const (
-	WireVarint WireType = 0
-	WireBytes  WireType = 2
+	WireVarint  WireType = 0
+	WireFixed64 WireType = 1
+	WireBytes   WireType = 2
+	WireFixed32 WireType = 5
 )
 
 type BlockKind uint8
@@ -91,8 +94,29 @@ func (w *Writer) WriteVarint(value uint64) {
 
 func (w *Writer) WriteString(tag uint32, value string) {
 	w.WriteHeader(tag, WireBytes)
+	w.WriteStringValue(value)
+}
+
+func (w *Writer) WriteStringValue(value string) {
 	w.WriteVarint(uint64(len(value)))
 	w.buf = append(w.buf, value...)
+}
+
+func (w *Writer) WriteBytes(value []byte) {
+	w.WriteVarint(uint64(len(value)))
+	w.buf = append(w.buf, value...)
+}
+
+func (w *Writer) WriteFixed32(value uint32) {
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], value)
+	w.buf = append(w.buf, buf[:]...)
+}
+
+func (w *Writer) WriteFixed64(value uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], value)
+	w.buf = append(w.buf, buf[:]...)
 }
 
 func (w *Writer) WritePackedVarints(values []uint64) {
@@ -260,6 +284,43 @@ func (r *Reader) ReadBytesView() ([]byte, error) {
 	start := r.pos
 	r.pos += int(n)
 	return r.data[start:r.pos], nil
+}
+
+func (r *Reader) ReadFixed32() (uint32, error) {
+	if len(r.data)-r.pos < 4 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	value := binary.LittleEndian.Uint32(r.data[r.pos:])
+	r.pos += 4
+	return value, nil
+}
+
+func (r *Reader) ReadFixed64() (uint64, error) {
+	if len(r.data)-r.pos < 8 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	value := binary.LittleEndian.Uint64(r.data[r.pos:])
+	r.pos += 8
+	return value, nil
+}
+
+func (r *Reader) SkipField(wireType WireType) error {
+	switch wireType {
+	case WireVarint:
+		_, err := r.ReadVarint()
+		return err
+	case WireFixed64:
+		_, err := r.ReadFixed64()
+		return err
+	case WireBytes:
+		_, err := r.ReadBytesView()
+		return err
+	case WireFixed32:
+		_, err := r.ReadFixed32()
+		return err
+	default:
+		return errors.New("bytemsg233: unsupported wire type")
+	}
 }
 
 func (r *Reader) ReadPackedVarints(dst []uint64) ([]uint64, error) {
