@@ -43,7 +43,7 @@ func TestReaderSkipsUnknownFields(t *testing.T) {
 }
 
 func TestProtocolHello(t *testing.T) {
-	local := ProtocolHello{Version: 7, Fingerprint: 0xabc, MinCompatible: 6}
+	local := ProtocolHello{Version: 7, MinCompatible: 6}
 	data := AppendProtocolHello(nil, local)
 	remote, err := ReadProtocolHello(data)
 	if err != nil {
