@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"unsafe"
 )
 
@@ -35,29 +36,41 @@ type Resettable interface {
 }
 
 type Pool[T Resettable] struct {
-	items   []T
-	factory func() T
+	items sync.Pool
 }
 
 func NewPool[T Resettable](factory func() T) *Pool[T] {
+	if factory == nil {
+		panic("bytemsg233: pool factory is nil")
+	}
 	return &Pool[T]{
-		items:   make([]T, 0),
-		factory: factory,
+		items: sync.Pool{
+			New: func() any {
+				return factory()
+			},
+		},
 	}
 }
 
 func (p *Pool[T]) Acquire() T {
-	if n := len(p.items); n > 0 {
-		value := p.items[n-1]
-		p.items = p.items[:n-1]
+	if p == nil {
+		var zero T
+		return zero
+	}
+	value, ok := p.items.Get().(T)
+	if ok {
 		return value
 	}
-	return p.factory()
+	var zero T
+	return zero
 }
 
 func (p *Pool[T]) Release(value T) {
+	if p == nil {
+		return
+	}
 	value.Reset()
-	p.items = append(p.items, value)
+	p.items.Put(value)
 }
 
 type Writer struct {
